@@ -1,0 +1,567 @@
+---
+title: "Prompts 2.0 analyses"
+author: "Sophia Minnillo"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: '4'
+  html_notebook:
+    df_print: paged
+    toc: true
+    toc_depth: 2
+  html_document:
+    toc: true
+    toc_depth: '4'
+    df_print: paged
+always_allow_html: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set Up
+
+```{r, include=FALSE, echo=FALSE}
+## SET UP ####
+#install.packages("tidyverse")
+library(tidyverse)
+library(Rmisc) #for SummarySE
+library(lme4)
+library(lmerTest)
+library("MASS")
+library(MuMIn)
+library(emmeans)
+library(nlme) #for designing models that deal with autocorrelation
+library(car) #for tests-- assumptions
+library(multilevelTools) #for assumptions
+library(JWileymisc)
+library(effectsize)
+#install.packages("remotes")  # if not installed
+#remotes::install_github("glmmTMB/glmmTMB/glmmTMB")
+library(glmmTMB) #special type of GLMM for right skewed data
+library(DHARMa) #model fit
+library(performance) #checks model performance
+library(effectsize)
+
+#load csvs
+lexis_012726 <- read_csv('TAALES_results_020526.csv')
+#view(lexis_012726)
+
+#past tense csv
+tense_020526 <- read_csv('prompts2_pret_imp_020526_5.csv')
+#view(tense_020526)
+#updated 2-19-26 based on Andrea manually cleaning the spacy output
+```
+
+```{r, echo=FALSE, include=FALSE}
+#export list of students who didn't produce any past tenses
+# metadata_prompts2 <- lexis_012726|>
+#   dplyr::select(c(filename, Participant, Course, Prompt))
+# #view(metadata_prompts2)
+# #view(tense_020526_sum)
+# 
+# #38 students, 76 texts
+# 
+# #left join tense csv by metadata. Need to use tense_020526_sum from later!
+# metadata_prompts2_tense <- metadata_prompts2|>
+#   left_join(tense_020526_sum, by = c('Participant', 'Course', 'Prompt'))
+#view(metadata_prompts2_tense)
+#write_csv(metadata_prompts2_tense, 'prompts_who_produced_past_020626.csv')
+
+#76
+
+#how many cases that students didn't produce any past tense: 14 texts
+```
+
+
+# Lexis Analysis
+
+## Inspect Data
+
+```{r, echo=FALSE}
+hist(lexis_012726$MATTR_lemmas)
+#fairly normally distributed
+
+hist(lexis_012726$lemma_frequency_log_CW)
+#a bit of a right skew-- more high frequency words
+#could try to keep transforming
+
+hist(lexis_012726$lexical_density)
+#steep curve, although averages out in center
+```
+
+## Graph Data
+
+```{r, echo=FALSE}
+#MAATR
+ggplot(data = lexis_012726,
+       aes(x = Prompt, y = MATTR_lemmas, color = Prompt)) +
+  geom_violin(draw_quantiles = .50) + 
+  #this shows the distribution of scores more clearly than a box plot
+  geom_jitter(shape=16, position=position_jitter(0.2))+
+  labs(x = "Prompt", y = "Lexical Diversity")+
+  ylim(0,1)+
+  scale_color_brewer(palette="Dark2")
+
+#lexical sophistication
+ggplot(data = lexis_012726,
+       aes(x = Prompt, y = lemma_frequency_log_CW, color = Prompt)) +
+  geom_violin(draw_quantiles = .50) + 
+  #this shows the distribution of scores more clearly than a box plot
+  geom_jitter(shape=16, position=position_jitter(0.2))+
+  labs(x = "Prompt", y = "Lexical Sophistication")+
+  ylim(0,13)+
+  scale_color_brewer(palette="Dark2")
+
+#lexical density
+ggplot(data = lexis_012726,
+       aes(x = Prompt, y = lexical_density, color = Prompt)) +
+  geom_violin(draw_quantiles = .50) + 
+  #this shows the distribution of scores more clearly than a box plot
+  geom_jitter(shape=16, position=position_jitter(0.2))+
+  labs(x = "Prompt", y = "Lexical Density")+
+  ylim(0,1)+
+  scale_color_brewer(palette="Dark2")
+```
+
+## Run LMER models
+
+Remember, Bonferroni correction: 0.00714 - statistical significance threshold.
+
+### MATTR
+```{r, echo=FALSE}
+#1a. How well do the prompts predict learners' lexical diversity?
+
+#mod1: no random slopes, random intercept by participant
+mod1 <- lmer(MATTR_lemmas ~ Prompt + (1|Participant), 
+             lexis_012726,  
+             control=lmerControl(optimizer="bobyqa",
+                                 optCtrl=list(maxfun=2e5)))
+summary(mod1)
+r.squaredGLMM(mod1)
+emmeans(mod1, specs = pairwise~Prompt)
+
+
+#effect size
+
+#first have to pivot tibble wider
+lexis_012726_cd <- lexis_012726|>
+  dplyr::select(Participant, Prompt, MATTR_lemmas)|>
+  pivot_wider(names_from = Prompt, values_from = MATTR_lemmas)
+#view(lexis_012726_cd)
+
+#Cohen's d
+effectsize::cohens_d(lexis_012726_cd$bad_time, lexis_012726_cd$good_time, pooled_sd = TRUE, paired = TRUE)
+#"Most of the time the actual population standard deviation is not known, this is why we estimate it using a pooled standard deviation from our two groups." (National University Stats Center)
+
+
+#effect size with emmeans package: ignoring https://rdrr.io/cran/emmeans/man/eff_size.html
+emm <- emmeans(mod1, ~ Prompt)
+eff_size(emm, sigma = sigma(mod1), edf = df.residual(mod1))
+
+#mod2: random slopes
+# mod2 <- lmer(MATTR_lemmas ~ Prompt + (1+Prompt||Participant), 
+#              lexis_012726,  
+#              control=lmerControl(optimizer="bobyqa",
+#                                  optCtrl=list(maxfun=2e5)))
+# summary(mod2)
+# r.squaredGLMM(mod2)
+# emmeans(mod2, specs = pairwise~Prompt)
+#not working
+
+#mod3: no random slopes, random intercept by participant & course
+#singularity warning!
+# mod3 <- lmer(MATTR_lemmas ~ Prompt + (1|Participant)+ (1|Course), 
+#              lexis_012726,  
+#              control=lmerControl(optimizer="bobyqa",
+#                                  optCtrl=list(maxfun=2e5)))
+# summary(mod3)
+# r.squaredGLMM(mod3)
+# emmeans(mod3, specs = pairwise~Prompt)
+```
+
+#### Check assumptions
+```{r, echo=FALSE}
+# 1. Linearity
+# 2. Normality of the residuals
+# 3. Homogeneity of residual variance (homoscedasticity)
+# 4. No autoccorelation and no multicolinearity
+# 
+# more about checking assumptions here: https://ademos.people.uic.edu/Chapter18.html
+# https://bookdown.org/animestina/phd_july_19/testing-the-assumptions.html
+# https://library.virginia.edu/data/articles/diagnostic-plots 
+# https://chenzixu.rbind.io/slides/lme/lmer#16
+#https://cran.r-project.org/web/packages/multilevelTools/vignettes/lmer-vignette.html
+
+#checking model assumptions
+
+#1. Checking Linearity Assumption:
+
+#let's try with sjplot
+sjPlot::plot_model(mod1, type='slope')
+
+plot(fitted(mod1),residuals(mod1))
+
+#2. Normality of the residuals
+lattice::qqmath(mod1)
+qqnorm(residuals(mod1))
+
+#3. Homogeneity of residual variance (homoscedasticity)
+#let's try with sjplot
+sjPlot::plot_model(mod1, type='diag')
+
+#4. No autoccorelation and no multicolinearity
+#checking autocorrelation
+acf(residuals(mod1))
+
+# Extract residuals and run durbinWatsonTest for autocorrelation
+mod1_residuals <- residuals(mod1)
+durbinWatsonTest(mod1_residuals)
+#because result is > 2, we're good
+
+#checking multicolinearity
+performance::check_collinearity(mod1)
+
+#JWileymisc::modelDiagnostics(mod1)
+md <- modelDiagnostics(mod1, ev.perc = .001)
+plot(md, ask = FALSE, ncol = 2, nrow = 3)
+```
+
+### Lexical sophistication
+```{r, echo=FALSE}
+#### lemma_frequency_log_CW models ####
+#1b. How well do the prompts predict learners' lexical sophistication?
+
+#mod_soph1: no random slopes, random intercept by participant
+mod_soph1 <- lmer(lemma_frequency_log_CW ~ Prompt + (1|Participant), 
+                  lexis_012726,  
+                  control=lmerControl(optimizer="bobyqa",
+                                      optCtrl=list(maxfun=2e5)))
+summary(mod_soph1)
+r.squaredGLMM(mod_soph1)
+emmeans(mod_soph1, specs = pairwise~Prompt)
+#effect size
+cohens_d(lemma_frequency_log_CW ~ Prompt, data = lexis_012726, pooled_sd = TRUE)
+
+#effect size with emmeans package
+emm <- emmeans(mod_soph1, "Prompt")
+eff_size(emm, sigma = sigma(mod_soph1), edf = df.residual(mod_soph1))
+
+#No significant difference for lexical sophistication:
+#high lexical sophistication anyways because speaking task
+```
+
+#### Check assumptions
+```{r, echo=FALSE}
+##### Check for Assumptions ####
+# 1. Linearity
+# 2. Normality of the residuals
+# 3. Homogeneity of residual variance (homoscedasticity)
+# 4. No autoccorelation and no multicolinearity
+# 
+# more about checking assumptions here: https://ademos.people.uic.edu/Chapter18.html
+# https://bookdown.org/animestina/phd_july_19/testing-the-assumptions.html
+# https://library.virginia.edu/data/articles/diagnostic-plots 
+# https://chenzixu.rbind.io/slides/lme/lmer#16
+#https://cran.r-project.org/web/packages/multilevelTools/vignettes/lmer-vignette.html
+
+#checking model assumptions
+
+#1. Checking Linearity Assumption:
+
+#let's try with sjplot
+sjPlot::plot_model(mod_soph1, type='slope')
+
+plot(fitted(mod_soph1),residuals(mod_soph1))
+
+#2. Normality of the residuals
+lattice::qqmath(mod_soph1)
+qqnorm(residuals(mod_soph1))
+
+#3. Homogeneity of residual variance (homoscedasticity)
+#let's try with sjplot
+sjPlot::plot_model(mod_soph1, type='diag')
+
+#4. No autoccorelation and no multicolinearity
+#checking autocorrelation
+acf(residuals(mod_soph1))
+
+# Extract residuals and run durbinWatsonTest for autocorrelation
+mod_soph1_residuals <- residuals(mod_soph1)
+durbinWatsonTest(mod_soph1_residuals)
+#because result is > 2, we're good
+
+#checking multicolinearity
+performance::check_collinearity(mod_soph1)
+
+#JWileymisc::modelDiagnostics(mod_soph1)
+md <- modelDiagnostics(mod_soph1, ev.perc = .001)
+plot(md, ask = FALSE, ncol = 2, nrow = 3)
+```
+
+### Lexical density
+```{r, echo=FALSE}
+#1a. How well do the prompts predict learners' lexical density?
+
+#mod_density1: no random slopes, random intercept by participant
+mod_density1 <- lmer(lexical_density ~ Prompt + (1|Participant), 
+                     lexis_012726,  
+                     control=lmerControl(optimizer="bobyqa",
+                                         optCtrl=list(maxfun=2e5)))
+summary(mod_density1)
+r.squaredGLMM(mod_density1)
+emmeans(mod_density1, specs = pairwise~Prompt)
+
+#effect size
+
+#first have to pivot tibble wider
+lexis_012726_cdLD <- lexis_012726|>
+  dplyr::select(Participant, Prompt, lexical_density)|>
+  pivot_wider(names_from = Prompt, values_from = lexical_density)
+#view(lexis_012726_cdLD)
+
+#Cohen's d
+effectsize::cohens_d(lexis_012726_cdLD$bad_time, lexis_012726_cdLD$good_time, pooled_sd = TRUE, paired = TRUE)
+#"Most of the time the actual population standard deviation is not known, this is why we estimate it using a pooled standard deviation from our two groups." (National University Stats Center)
+
+#effect size with emmeans package
+emm <- emmeans(mod_density1, "Prompt")
+eff_size(emm, sigma = sigma(mod_density1), edf = df.residual(mod_density1))
+```
+
+#### Check assumptions
+```{r, echo=FALSE}
+# 1. Linearity
+# 2. Normality of the residuals
+# 3. Homogeneity of residual variance (homoscedasticity)
+# 4. No autoccorelation and no multicolinearity
+# 
+# more about checking assumptions here: https://ademos.people.uic.edu/Chapter18.html
+# https://bookdown.org/animestina/phd_july_19/testing-the-assumptions.html
+# https://library.virginia.edu/data/articles/diagnostic-plots 
+# https://chenzixu.rbind.io/slides/lme/lmer#16
+#https://cran.r-project.org/web/packages/multilevelTools/vignettes/lmer-vignette.html
+
+#checking model assumptions
+
+#1. Checking Linearity Assumption:
+
+#let's try with sjplot
+sjPlot::plot_model(mod_density1, type='slope')
+
+plot(fitted(mod_density1),residuals(mod_density1))
+
+#2. Normality of the residuals
+lattice::qqmath(mod_density1)
+qqnorm(residuals(mod_density1))
+
+#3. Homogeneity of residual variance (homoscedasticity)
+#let's try with sjplot
+sjPlot::plot_model(mod_density1, type='diag')
+
+#4. No autoccorelation and no multicolinearity
+#checking autocorrelation
+acf(residuals(mod_density1))
+
+# Extract residuals and run durbinWatsonTest for autocorrelation
+mod_density1_residuals <- residuals(mod_density1)
+durbinWatsonTest(mod_density1_residuals)
+#because result is > 2, we're good
+
+#checking multicolinearity
+performance::check_collinearity(mod_density1)
+
+#JWileymisc::modelDiagnostics(mod_density1)
+md <- modelDiagnostics(mod_density1, ev.perc = .001)
+plot(md, ask = FALSE, ncol = 2, nrow = 3)
+```
+
+## Qualitative: Lexical sophistication analysis
+
+1. using spacy, extract all content words from texts (tokens and lemma forms), keeping metadata from texts
+2. calculate log frequency of lemmas
+3. graph distribution of lexical sophistication (violin plots)
+4. demonstrate what this looks like in real student texts
+
+```{r, echo=FALSE}
+
+```
+
+### examples of contrasts between the same student
+
+P5_SPA3_bad_time_solo_palabras
+
+Una vez estábamos en el lugar de trabajo en un restaurante y un hombre Un hombre estaba muy grave Y creo que El era Creo que el hablaba con los de Y muchos chicos y y madres Visitan a mi restaurantes Cuando un hombre que no se come nada por el restaurante No sé que quien Y mi manager tenía que Y Mi manager es mi amigo también Y un poco bajo un hombre que que no conozco Y era un poco mal pero llamé la seguridad Y otro hombre a venga y S  Pues si si Al final no pasó nada Todo estaba bien Sí Sí [Tu amigo estaba bien] Sí si si sí Pero Muchos gritos muchos ruidos En esos momentos tenía que estar listo Lista Yo se poco Un poco  Luchador no no No necesito pelear a nadie En serio puedo hacer poco pero No peleaba con nadie En serio Él es muy serio y muy tranquilo Y también sabe que pelear El boxing Pero Pero es Yo sé que El No no A él no le gusta Quiero pelear Nadie En serio
+
+P5_SPA3_good_time_solo_palabras
+
+La última fin de semana mi amigo tenía un fiesta por Halloween Un poco tarde pero nosotros lle llevábamos costumbres y  Y Y había muchos comida o muchas comidas y bebidas y también tra trabajó con eso amigo muchos de mi O compañeros de trabajo es es tu Estuvieron Sí Sí y era divertido Especialmente con esos personas Porque en trabajo no podemos hablar mucho porque estamos trabajando Pero A mi me gustan esos personas Esas personas A mis costumbre Era un como un cowboy Y Y mi novio era un samurai Yo comí Mi compañero de trabajo trajo sopa Un poco extraño traer sopa a una fiesta, pero a ella cono cono la cono cono Conocer con cocina Cociné cociné y es Era muy delicioso rico
+
+P6_SPA22_bad_time_solo_palabras
+
+Hay una vez cuando mi amiga y yo fuimos a una fiesta de de cumple cumpleaños y Cuando la fiesta termina mi amiga y yo necesitamos mi amiga y yo tenemos que necesitar caminar a mi casa y mi casa Fue cerca de la fiesta pero fue en la noche y mi amiga y yo caminamos Camina Caminamos A mi casa pero fue en la noche y hay no no Otras personas con con nos y mi casa Y la fiesta fue cercano de Pero Pero esta noche siéntete No a esta noche El camino fue muy muy largo y cuando mi amiga y yo Y llegamos a nuestras casas Estamos muy alegre y No tengo miedo Después de el camino Pero durante el camino tenemos miedo
+
+P6_SPA22_good_time_solo_palabras
+
+Estoy alegre Cuando está el Navidad Y en el año pasado En la Navidad Estoy con mi familia y Tuvimos a una fiesta de Navidad Hay muchos muchos regalos y muchas comidas Y mi familia y yo Pasamos una día con Pasamos una dia en la cocina y tenemos que cocinar todos la comida para la fiesta y para la Navidad Nosotros cocinamos a los galletos El carne las papas fritas y cocinamos Cocinamos otros Otros postres Tengo. Tuve mucho divertido porque Porque me gusta cocinar y me gusta mi familia Y estoy con mi familia Y la fiesta fue muy divertido pienso Pienso Recibe Los Para el esqui Para esquiar Pienso Pienso Celebramos Celebramos En el día antes de Navidad Celebramos en la casa
+
+
+# Tense-Aspect Analysis
+
+Steps:
+
+1. Calculate number of preterit and imperfect uses per file
+
+2. inspect data
+
+3. run models with this data --> logistic mixed-effects regression
+
+
+```{r, include=FALSE, echo=FALSE}
+tense_020526_sum <- tense_020526 |>
+  dplyr::group_by(Participant, Course, Prompt, Tense)|>
+  dplyr::summarize(count = n())|>
+  pivot_wider(names_from = Tense, values_from = count)|>
+  mutate(
+    preterit = replace_na(preterit, 0),
+    imperfect = replace_na(imperfect, 0)
+  )|>
+  #join with lexis spreadsheet to get wordcount info for text, then calculate proportion
+  full_join(lexis_012726)|>
+  dplyr::select(c(Participant, Course, Prompt, imperfect, preterit, nwords))|>
+  mutate(
+    preterit = replace_na(preterit, 0),
+    imperfect = replace_na(imperfect, 0)
+  )|>
+  dplyr::rowwise()|>
+  dplyr::mutate(
+    preterit_per_100_words = (preterit / nwords * 100),
+    imperfect_per_100_words = (imperfect / nwords * 100)
+  )
+
+#view(tense_020526_sum)
+
+#how many students produced absolutely no past
+#12 total students, 14 cases (P44 and P30 produced no past in both prompt conditions)
+```
+
+Students with absolutely no past production: 12 total students, 14 cases (P44 and P30 produced no past in both prompt conditions)
+
+## Inspect Data
+
+```{r, echo=FALSE}
+hist(tense_020526_sum$preterit_per_100_words)
+
+hist(tense_020526_sum$imperfect_per_100_words)
+#super right skewed! lots of 0s
+```
+
+## Graph Data
+
+```{r, echo=FALSE}
+#preterit
+ggplot(data = tense_020526_sum,
+       aes(x = Prompt, y = preterit_per_100_words, color = Prompt)) +
+  geom_violin(draw_quantiles = .50) + 
+  #this shows the distribution of scores more clearly than a box plot
+  geom_jitter(shape=16, position=position_jitter(0.2))+
+  labs(x = "Prompt", y = "Preterit Use per 100 Words")+
+  ylim(-5,15)+
+  scale_color_brewer(palette="Dark2")
+
+#imperfect
+ggplot(data = tense_020526_sum,
+       aes(x = Prompt, y = imperfect_per_100_words, color = Prompt)) +
+  geom_violin(draw_quantiles = .50) + 
+  #this shows the distribution of scores more clearly than a box plot
+  geom_jitter(shape=16, position=position_jitter(0.2))+
+  labs(x = "Prompt", y = "Imperfect Use per 100 Words")+
+  ylim(-5,15)+
+  scale_color_brewer(palette="Dark2")
+```
+
+## Run Tweedie mixed effects model (GLMM)
+
+### Preterit
+
+```{r, echo=FALSE}
+#view(tense_020526_sum)
+M1preterit <- glmmTMB(preterit_per_100_words ~ Prompt + (1|Participant),
+            	data = tense_020526_sum,
+            	family = tweedie(link = "log"))
+summary(M1preterit)
+r.squaredGLMM(M1preterit)
+#emmeans
+emm_pret <- emmeans(M1preterit, ~ Prompt, type = "response")
+emm_pret
+contrast(emm_pret, method = "revpairwise")  # differences on response scale
+
+#effect size with emmeans package
+emm <- emmeans(M1preterit, "Prompt")
+eff_size(emm, sigma = sigma(M1preterit), edf = df.residual(M1preterit))
+```
+
+#### Check assumptions
+
+```{r}
+# Check Simulated residuals- residual diagnostics
+sim_res <- DHARMa::simulateResiduals(M1preterit)
+plot(sim_res)
+#additional tests
+DHARMa::testUniformity(sim_res)     # global model fit
+DHARMa::testDispersion(sim_res)     # over/under-dispersion
+DHARMa::testZeroInflation(sim_res)  # unexpected excess zeros
+```
+
+### Imperfect
+
+```{r, echo=FALSE}
+#view(tense_020526_sum)
+M1imperfect <- glmmTMB(imperfect_per_100_words ~ Prompt + (1|Participant),
+            	data = tense_020526_sum,
+            	family = tweedie(link = "log"))
+summary(M1imperfect)
+r.squaredGLMM(M1imperfect)
+#emmeans
+emm_imp <- emmeans(M1imperfect, ~ Prompt, type = "response")
+emm_imp
+contrast(emm_imp, method = "revpairwise")  # differences on response scale
+
+#effect size with emmeans package
+emm <- emmeans(M1imperfect, "Prompt")
+eff_size(emm, sigma = sigma(M1imperfect), edf = df.residual(M1imperfect))
+```
+
+#### Check assumptions
+
+```{r, echo=FALSE}
+# Check Simulated residuals- residual diagnostics
+sim_res <- DHARMa::simulateResiduals(M1imperfect)
+plot(sim_res)
+#additional tests
+DHARMa::testUniformity(sim_res)     # global model fit
+DHARMa::testDispersion(sim_res)     # over/under-dispersion
+DHARMa::testZeroInflation(sim_res)  # unexpected excess zeros
+```
+
+# P-value adjustment
+
+```{r, echo=FALSE}
+pvalues<-c(0.000222,
+0.000305,
+0.0042,
+0.0162,
+0.017,
+0.0228,
+0.045,
+0.087,
+0.275,
+0.348,
+0.4)
+
+fdrs<-p.adjust(pvalues, method="BH")
+print(fdrs)
+```
+
