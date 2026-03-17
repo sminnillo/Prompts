@@ -1,0 +1,411 @@
+---
+title: "Fluency Analysis (Prompt Valence)"
+author: "Paloma Fernandez Mira"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = TRUE, message = TRUE)
+
+# Core
+library(tidyverse)
+library(janitor)
+
+# Mixed effects + inference
+library(lme4)
+library(lmerTest)   # p-values for lmer (Satterthwaite)
+library(MuMIn)      # r.squaredGLMM()
+library(emmeans)
+
+# Diagnostics
+library(lattice)      # qqmath()
+library(sjPlot)       # plot_model()
+library(car)          # durbinWatsonTest()
+library(performance)  # check_singularity(), check_collinearity()
+library(JWileymisc)   # modelDiagnostics()
+
+# Tables
+library(broom.mixed)
+library(gt)
+
+# Input file
+STORY_CSV <- "fluency_story_level.csv"
+
+# If story file contains multiple speakers, set this to the learner label.
+LEARNER_SPEAKER <- "Speaker2"
+
+# Toggle: full diagnostics for each model (can make the PDF long)
+DO_DIAGNOSTICS <- FALSE
+```
+
+# Research question and operationalizations
+
+We compare two prompts:
+
+- **Negative valence:** "tell a story about a time you or someone you know felt in danger"
+- **Positive valence:** "tell a story about a time you or someone you know had a good time"
+
+Fluency is operationalized at story level:
+
+1. **Speech rate**: lexical tokens per minute
+   Learner speaking time = sum of learner-turn durations within the story (from timestamps).
+   Lexical tokens include Spanish + English words, excluding obvious filled pauses.
+
+2. **Breakdown fluency (without silent pauses)**:
+   - Filled pause rate per minute
+   - Filled pause rate per 100 lexical tokens
+
+3. **L1 reliance (English rate)**:
+   - English tokens per 100 lexical tokens
+
+4. **Non-Spanish token rate**:
+   - (filled pauses + English tokens) per 100 lexical tokens
+
+5. **False starts**:
+   - False starts per minute
+
+# Load and prepare data
+
+```{r load-data}
+df <- read_csv(STORY_CSV, show_col_types = FALSE) |> clean_names()
+
+# Keep learner speaker only (if multiple speakers exist)
+if ("speaker" %in% names(df)) {
+  df <- df |> filter(speaker == LEARNER_SPEAKER)
+}
+
+glimpse(df)
+```
+
+## Sample check
+
+```{r sample-check}
+df |>
+  dplyr::count(course, prompt) |>
+  arrange(course, prompt) |>
+  gt()
+
+df |>
+  dplyr::summarise(
+    n_rows         = n(),
+    n_participants = n_distinct(participant_id),
+    n_courses      = n_distinct(course)
+  ) |>
+  gt()
+```
+
+# Derive analysis variables
+
+```{r derive-measures}
+df <- df |>
+  dplyr::mutate(
+    participant_id = factor(participant_id),
+    course         = factor(course),
+    prompt         = factor(prompt),
+
+    valence = case_when(
+      str_to_lower(as.character(prompt)) %in% c("bad time","bad_time","negative","neg") ~ "Negative",
+      str_to_lower(as.character(prompt)) %in% c("good time","good_time","positive","pos") ~ "Positive",
+      TRUE ~ as.character(prompt)
+    ),
+    valence = factor(valence, levels = c("Negative", "Positive"))
+  ) |>
+  mutate(
+    # 1) Speech rate
+    speech_rate_tpm = coalesce(
+      kept_lexical_tokens_per_min,
+      total_kept_lexical_tokens_excl_false / total_minutes
+    ),
+
+    # 2) Filled pause rates
+    fp_per_min    = coalesce(
+      raw_filler_tokens_per_min,
+      total_raw_filler_tokens / total_minutes
+    ),
+    fp_per_100lex = 100 * total_raw_filler_tokens / pmax(total_kept_lexical_tokens_excl_false, 1),
+
+    # 3) English rate (L1 reliance)
+    english_per_100lex = coalesce(
+      removed_lexical_est_english_per_100_kept_lexical,
+      100 * total_removed_lexical_est_english / pmax(total_kept_lexical_tokens_excl_false, 1)
+    ),
+
+    # 4) Non-Spanish token rate
+    non_spanish_per_100lex = fp_per_100lex + english_per_100lex,
+
+    # 5) False starts
+    false_starts_per_min2   = coalesce(
+      false_starts_per_min,
+      total_false_start_tokens / total_minutes
+    ),
+    false_starts_per_100lex = 100 * total_false_start_tokens / pmax(total_kept_lexical_tokens_excl_false, 1)
+  )
+
+# Outcomes included in this analysis
+dvs <- c(
+  "speech_rate_tpm",
+  "fp_per_min",
+  "fp_per_100lex",
+  "english_per_100lex",
+  "non_spanish_per_100lex",
+  "false_starts_per_min2"
+)
+
+# Bonferroni for this set
+bonf_n     <- length(dvs)
+bonf_alpha <- 0.05 / bonf_n
+bonf_alpha
+```
+
+# Inspect distributions
+
+```{r histograms, fig.height=7}
+par(mfrow = c(3, 2))
+hist(df$speech_rate_tpm,        main = "Speech rate (tokens/min)",             xlab = "tokens/min")
+hist(df$fp_per_min,             main = "Filled pauses per minute",             xlab = "FP/min")
+hist(df$fp_per_100lex,          main = "Filled pauses per 100 lexical tokens", xlab = "FP/100lex")
+hist(df$english_per_100lex,     main = "English per 100 lexical tokens",       xlab = "Eng/100lex")
+hist(df$non_spanish_per_100lex, main = "Non-Spanish per 100 lexical tokens",   xlab = "(FP+Eng)/100lex")
+hist(df$false_starts_per_min2,  main = "False starts per minute",              xlab = "FS/min")
+par(mfrow = c(1, 1))
+```
+
+# Linear mixed-effects models (LMER)
+
+We fit one LMER per outcome:
+
+- **Fixed effect:** prompt valence
+- **Random intercepts:** course and student nested within course
+  `DV ~ valence + (1 | course/participant_id)`
+
+Bonferroni threshold for these `r bonf_n` outcomes: **`r signif(bonf_alpha, 5)`**.
+
+```{r model-helpers}
+fit_lmer <- function(data, dv) {
+  f <- as.formula(paste0(dv, " ~ valence + (1|course/participant_id)"))
+  lmer(
+    f, data = data,
+    control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+  )
+}
+
+summarize_model <- function(mod) {
+  print(summary(mod))
+  print(r.squaredGLMM(mod))
+  print(emmeans(mod, specs = pairwise ~ valence))
+  cat("\nSingularity check:\n")
+  print(performance::check_singularity(mod))
+}
+```
+
+## Run models
+
+```{r run-models}
+mods <- setNames(vector("list", length(dvs)), dvs)
+
+for (dv in dvs) {
+  cat("\n\n==============================\n")
+  cat("MODEL:", dv, "\n")
+  cat("==============================\n\n")
+  mods[[dv]] <- fit_lmer(df, dv)
+  summarize_model(mods[[dv]])
+}
+```
+
+# Slide-style plots
+
+```{r slide-plots, echo=FALSE, fig.height=5, fig.width=6}
+# Human-readable labels for each DV
+dv_labels <- c(
+  speech_rate_tpm        = "Speech rate (lexical tokens/min)",
+  fp_per_min             = "Filled pauses/min",
+  fp_per_100lex          = "Filled pauses/100 lexical tokens",
+  english_per_100lex     = "English/100 lexical tokens",
+  non_spanish_per_100lex = "Non-Spanish/100 lexical tokens",
+  false_starts_per_min2  = "False starts/min"
+)
+
+# Colour palette matching slide (green = Negative, orange = Positive)
+valence_colors <- c("Negative" = "#2E8B6E", "Positive" = "#D4611A")
+
+# Extract R2c for each model (mods already exists from run-models chunk)
+r2c_values <- sapply(dvs, function(dv) {
+  r2 <- MuMIn::r.squaredGLMM(mods[[dv]])
+  unname(r2[, "R2c"])
+})
+
+plot_slide_style <- function(data, dv, ylab) {
+
+  ggplot(data = data,
+         aes(x = valence, y = .data[[dv]], color = valence)) +
+
+    # Violin with median line drawn across full width via draw_quantiles
+    geom_violin(draw_quantiles = 0.50, trim = FALSE, fill = NA, linewidth = 0.9) +
+
+    # Jittered points
+    geom_jitter(shape = 16, position = position_jitter(0.2), alpha = 0.8, size = 2) +
+
+    scale_color_manual(values = valence_colors) +
+    scale_x_discrete(labels  = c("Negative" = "bad_time", "Positive" = "good_time")) +
+
+    labs(x = "Prompt", y = ylab, color = NULL) +
+
+    theme_bw(base_size = 14) +
+    theme(
+      legend.position  = "none",
+      panel.grid.major = element_line(color = "grey90"),
+      panel.grid.minor = element_blank(),
+      panel.background = element_rect(fill = "white"),
+      plot.background  = element_rect(fill = "white", color = NA),
+      axis.title       = element_text(size = 13),
+      axis.text        = element_text(color = "grey40", size = 12)
+    )
+}
+
+# Print one plot per DV
+for (dv in dvs) {
+  p <- plot_slide_style(
+    data    = df,
+    dv      = dv,
+    ylab    = dv_labels[[dv]]
+  )
+  print(p)
+}
+```
+
+# Manuscript-ready results table (valence effect)
+
+This table reports the **fixed effect of Positive vs Negative** prompt valence for each outcome,
+including 95% CI, p-value, Bonferroni-adjusted p-value, and R2 (marginal/conditional).
+
+```{r manuscript-table}
+extract_valence_row <- function(mod, outcome) {
+  te <- broom.mixed::tidy(mod, effects = "fixed", conf.int = TRUE) |>
+    filter(term == "valencePositive") |>
+    mutate(outcome = outcome)
+
+  r2 <- MuMIn::r.squaredGLMM(mod)
+  te$marginal_r2    <- unname(r2[1])
+  te$conditional_r2 <- unname(r2[2])
+  te
+}
+
+tab <- map_dfr(names(mods), ~ extract_valence_row(mods[[.x]], .x)) |>
+  mutate(
+    p_bonf   = p.adjust(p.value, method = "bonferroni", n = bonf_n),
+    sig_bonf = if_else(!is.na(p.value) & p.value < bonf_alpha, "YES", "no")
+  ) |>
+  select(
+    outcome,
+    estimate, conf.low, conf.high, std.error, df, statistic, p.value, p_bonf,
+    marginal_r2, conditional_r2, sig_bonf
+  )
+
+label_map <- c(
+  speech_rate_tpm        = "Speech rate (tokens/min)",
+  fp_per_min             = "Filled pauses/min",
+  fp_per_100lex          = "Filled pauses/100 lexical",
+  english_per_100lex     = "English/100 lexical",
+  non_spanish_per_100lex = "Non-Spanish/100 lexical (FP+Eng)",
+  false_starts_per_min2  = "False starts/min"
+)
+
+tab <- tab |>
+  mutate(outcome = dplyr::recode(outcome, !!!label_map))
+
+tab |>
+  gt() |>
+  tab_header(title = "Valence effect (Positive vs Negative) across fluency outcomes") |>
+  fmt_number(
+    columns  = c(estimate, conf.low, conf.high, std.error, statistic, p.value, p_bonf, marginal_r2, conditional_r2),
+    decimals = 4
+  ) |>
+  cols_label(
+    estimate       = "b",
+    conf.low       = "CI low",
+    conf.high      = "CI high",
+    std.error      = "SE",
+    df             = "df",
+    statistic      = "t",
+    p.value        = "p",
+    p_bonf         = "p (Bonf)",
+    marginal_r2    = "R2m",
+    conditional_r2 = "R2c",
+    sig_bonf       = paste0("p < ", signif(bonf_alpha, 5), "?")
+  )
+```
+
+# Diagnostics (optional)
+
+```{r diagnostics, eval=TRUE}
+if (DO_DIAGNOSTICS) {
+  for (dv in names(mods)) {
+    mod <- mods[[dv]]
+    cat("\n\n==============================\n")
+    cat("DIAGNOSTICS:", dv, "\n")
+    cat("==============================\n\n")
+
+    print(sjPlot::plot_model(mod, type = "slope"))
+
+    plot(fitted(mod), residuals(mod), main = paste("Residuals vs fitted:", dv))
+    abline(h = 0, lty = 2)
+
+    lattice::qqmath(mod, main = paste("QQ (random effects):", dv))
+    qqnorm(residuals(mod), main = paste("QQ (residuals):", dv))
+    qqline(residuals(mod))
+
+    if (requireNamespace("glmmTMB", quietly = TRUE)) {
+      print(sjPlot::plot_model(mod, type = "diag"))
+    } else {
+      cat("Skipping sjPlot diag panel (install glmmTMB to enable).\n")
+    }
+
+    acf(residuals(mod), main = paste("ACF residuals:", dv))
+    print(car::durbinWatsonTest(residuals(mod)))
+    print(performance::check_collinearity(mod))
+    print(performance::check_model(mod))
+    print(performance::check_normality(mod))
+    print(performance::check_heteroscedasticity(mod))
+    print(performance::check_outliers(mod))
+  }
+}
+```
+
+# Effect sizes
+
+## Speech rate 
+
+```{r eff_size, echo=FALSE}
+#effect size
+#view(df) speech_rate_tpm
+#first have to pivot tibble wider
+df_cd_speech_rate <- df|>
+  dplyr::select(participant_id, prompt, speech_rate_tpm)|>
+  pivot_wider(names_from = prompt, values_from = speech_rate_tpm)
+#view(df_cd_speech_rate)
+
+#Cohen's d
+effectsize::cohens_d(df_cd_speech_rate$`bad time`, df_cd_speech_rate$`good time`, pooled_sd = TRUE, paired = TRUE)
+#"Most of the time the actual population standard deviation is not known, this is why we estimate it using a pooled standard deviation from our two groups." (National University Stats Center)
+```
+
+## Filled pauses/100 lexical tokens
+
+
+```{r eff_size1, echo=FALSE}
+#first have to pivot tibble wider
+df_cd_fp_per_100lex <- df|>
+  dplyr::select(participant_id, prompt, fp_per_100lex)|>
+  pivot_wider(names_from = prompt, values_from = fp_per_100lex)
+#view(df_cd_fp_per_100lex)
+
+#Cohen's d
+effectsize::cohens_d(df_cd_fp_per_100lex$`bad time`, df_cd_fp_per_100lex$`good time`, pooled_sd = TRUE, paired = TRUE)
+```
